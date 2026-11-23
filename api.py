@@ -2,14 +2,14 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 import config
 import db
 import ffapi
 from likesvc import process_like, quota
+from panel import PAGE
 from pool import pool, LikeError
 
 ffapi.QUIET = True
@@ -30,7 +30,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="FF Like API", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=config.BASE_DIR / "dashboard"), name="static")
 
 
 # ------------------------------------------------------------------ auth
@@ -77,9 +76,9 @@ class RefillIn(BaseModel):
 
 
 # ------------------------------------------------------------------ pages
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def index():
-    return FileResponse(config.BASE_DIR / "dashboard" / "index.html")
+    return PAGE
 
 
 @app.get("/health")
@@ -99,11 +98,10 @@ async def status():
 @app.get("/api/profile/{uid}")
 async def profile(uid: str, region: str = config.DEFAULT_REGION, _=Depends(api_auth)):
     row = db.claim_guest(region.upper(), 10**6, "")
-    jwt = row["jwt"] if row else None
-    if not jwt:
+    if not row:
         raise HTTPException(503, "no account")
     try:
-        p = await asyncio.to_thread(ffapi.profile, jwt, region.upper(), uid)
+        p = await asyncio.to_thread(ffapi.profile, row["jwt"], region.upper(), uid)
     finally:
         db.set_guest(row["id"], status="ready")
     if not p:
@@ -121,7 +119,8 @@ async def api_like(body: LikeIn, _=Depends(api_auth)):
 
 @app.get("/api/quota/{discord_id}")
 async def api_quota(discord_id: int, _=Depends(api_auth)):
-    return {"quota": quota(discord_id), "credits": (db.ensure_user(discord_id) or {}).get("credits", 0)}
+    u = db.ensure_user(discord_id)
+    return {"quota": quota(discord_id), "credits": u["credits"]}
 
 
 # ------------------------------------------------------------------ admin
