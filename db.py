@@ -49,7 +49,6 @@ def init():
             _conn.execute("INSERT OR IGNORE INTO settings(k, v) VALUES(?,?)", (k, v))
         _conn.commit()
 
-# ---------------------------------------------------------------- settings
 def get_setting(key: str) -> str:
     with _lock:
         row = _conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
@@ -71,7 +70,6 @@ def settings() -> dict:
         "maintenance_msg": get_setting("maintenance_msg"),
     }
 
-# ---------------------------------------------------------------- users
 def ensure_user(discord_id: int) -> dict:
     with _lock:
         _conn.execute("INSERT OR IGNORE INTO users(discord_id, credits, created) "
@@ -129,7 +127,6 @@ def bump_total(discord_id: int, n: int) -> None:
                       (n, discord_id))
         _conn.commit()
 
-# ---------------------------------------------------------------- daily
 def daily_used(user_id: int, day: str = None) -> int:
     day = day or today_str()
     with _lock:
@@ -145,7 +142,6 @@ def add_daily(user_id: int, n: int, day: str = None) -> None:
                       (user_id, day, n))
         _conn.commit()
 
-# ---------------------------------------------------------------- guests
 def add_guest(uid: str, password: str, device_json: str, region: str) -> int:
     with _lock:
         cur = _conn.execute(
@@ -169,7 +165,6 @@ def set_guest(gid: int, **fields) -> None:
         _conn.commit()
 
 def claim_guest(region: str, cap: int, day: str):
-    """Least-recently-used ready account under its daily cap. Atomic claim."""
     with _lock:
         rows = _conn.execute(
             "SELECT * FROM guests WHERE region=? AND status='ready' "
@@ -177,8 +172,8 @@ def claim_guest(region: str, cap: int, day: str):
             "ORDER BY COALESCE(last_used,'') ASC LIMIT 8",
             (region, day, cap)).fetchall()
         for row in rows:
-            cur = _conn.execute("UPDATE guests SET status='busy' "
-                                "WHERE id=? AND status='ready'", (row["id"],))
+            cur = _conn.execute("UPDATE guests SET status='busy', last_used=? "
+                                "WHERE id=? AND status='ready'", (now_iso(), row["id"]))
             _conn.commit()
             if cur.rowcount == 1:
                 return dict(row)
@@ -216,7 +211,6 @@ def purge_dead() -> int:
         _conn.commit()
         return cur.rowcount
 
-# ---------------------------------------------------------------- logs
 def log_like(user_id, target, amount, ok, guest, note="") -> None:
     with _lock:
         _conn.execute("INSERT INTO logs(user_id, target, amount, ok, guest, note, created) "
@@ -236,3 +230,12 @@ def stats() -> dict:
         today = _conn.execute("SELECT COALESCE(SUM(likes),0) c FROM daily WHERE day=?",
                               (today_str(),)).fetchone()["c"]
         return {"users": users, "total_likes": likes, "today_likes": today}
+
+def users_list(limit: int = 200):
+    with _lock:
+        rows = _conn.execute(
+            "SELECT u.discord_id, u.credits, u.total_likes, u.banned, "
+            "COALESCE(d.likes,0) AS today FROM users u "
+            "LEFT JOIN daily d ON d.user_id=u.discord_id AND d.day=? "
+            "ORDER BY u.credits DESC LIMIT ?", (today_str(), limit)).fetchall()
+        return [dict(r) for r in rows]
