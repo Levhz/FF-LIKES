@@ -32,7 +32,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FF Like API", lifespan=lifespan)
 
 
-# ------------------------------------------------------------------ auth
 def api_auth(x_api_key: str = Header(None)):
     if x_api_key != config.API_KEY:
         raise HTTPException(401, "bad api key")
@@ -44,7 +43,6 @@ def admin_auth(authorization: str = Header(None)):
         raise HTTPException(401, "unauthorized")
 
 
-# ------------------------------------------------------------------ models
 class LikeIn(BaseModel):
     uid: str
     amount: int = 1
@@ -75,7 +73,6 @@ class RefillIn(BaseModel):
     count: int = 3
 
 
-# ------------------------------------------------------------------ pages
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return PAGE
@@ -86,7 +83,6 @@ async def health():
     return {"ok": True}
 
 
-# ------------------------------------------------------------------ public
 @app.get("/api/status")
 async def status():
     st = db.settings()
@@ -97,13 +93,10 @@ async def status():
 
 @app.get("/api/profile/{uid}")
 async def profile(uid: str, region: str = config.DEFAULT_REGION, _=Depends(api_auth)):
-    row = db.claim_guest(region.upper(), 10**6, "")
-    if not row:
-        raise HTTPException(503, "no account")
     try:
-        p = await asyncio.to_thread(ffapi.profile, row["jwt"], region.upper(), uid)
-    finally:
-        db.set_guest(row["id"], status="ready")
+        p = await pool.get_profile(uid, region.upper())
+    except Exception as e:
+        raise HTTPException(503, f"account unavailable: {e}")
     if not p:
         raise HTTPException(404, "not found")
     return p
@@ -123,7 +116,6 @@ async def api_quota(discord_id: int, _=Depends(api_auth)):
     return {"quota": quota(discord_id), "credits": u["credits"]}
 
 
-# ------------------------------------------------------------------ admin
 @app.post("/admin/login")
 async def admin_login(body: LoginIn):
     if body.password != config.ADMIN_TOKEN:
@@ -133,9 +125,13 @@ async def admin_login(body: LoginIn):
 
 @app.get("/admin/overview", dependencies=[Depends(admin_auth)])
 async def admin_overview():
-    st = db.settings()
-    return {"settings": st, "stats": db.stats(), "pool": db.pool_counts(),
+    return {"settings": db.settings(), "stats": db.stats(), "pool": db.pool_counts(),
             "guests": db.guest_list(50), "logs": db.recent_logs(25)}
+
+
+@app.get("/admin/users", dependencies=[Depends(admin_auth)])
+async def admin_users():
+    return db.users_list()
 
 
 @app.post("/admin/settings", dependencies=[Depends(admin_auth)])
