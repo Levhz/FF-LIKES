@@ -499,18 +499,34 @@ def step_register(dev, region, ipc):
                     "Accept": "application/json", "Accept-Encoding": "gzip",
                     "Authorization": f"Signature {sig}",
                     "Content-Type": "application/json; charset=utf-8"})
-    r = fetch(AUTH_HOST, "/api/v2/oauth/guest:register", headers, data=body)
-    dbg("guest:register", r)
-    if not isinstance(r, requests.Response):
-        raise RuntimeError(f"no response ({r})")
-    try:
-        data = r.json().get("data") or {}
-    except ValueError:
-        raise RuntimeError(f"HTTP {r.status_code} non-JSON: {r.text[:160]}")
-    uid = data.get("uid")
-    if not uid:
-        raise RuntimeError(f"rejected HTTP {r.status_code}: {r.text[:160]}")
-    return str(uid), password
+    last = "register failed"
+    for attempt in range(5):
+        r = fetch(AUTH_HOST, "/api/v2/oauth/guest:register", headers, data=body)
+        dbg("guest:register", r)
+        if not isinstance(r, requests.Response):
+            last = f"no response ({r})"
+            time.sleep(1.5 + attempt)
+            continue
+        if r.status_code == 429:
+            ra = r.headers.get("Retry-After")
+            time.sleep(int(ra) if ra and ra.isdigit() else 4 + attempt * 4)
+            last = "HTTP 429 rate limited"
+            continue
+        try:
+            data = r.json().get("data") or {}
+        except ValueError:
+            last = f"HTTP {r.status_code} non-JSON: {r.text[:160]}"
+            time.sleep(1.5)
+            continue
+        uid = data.get("uid")
+        if not uid:
+            last = f"rejected HTTP {r.status_code}: {r.text[:160]}"
+            if r.status_code >= 500:
+                time.sleep(2 + attempt)
+                continue
+            break
+        return str(uid), password
+    raise RuntimeError(last)
 
 def step_token(uid, password, dev, region, ipc):
     headers = with_ip(device_headers(dev), spoof_ip(ipc))
