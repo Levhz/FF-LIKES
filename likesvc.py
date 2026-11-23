@@ -2,6 +2,7 @@ import asyncio
 
 import config
 import db
+import ffapi
 from pool import pool, LikeError
 from utils import today_str, until_reset, clean_uid
 
@@ -25,32 +26,32 @@ def quota(user_id: int) -> dict:
 async def process_like(user_id: int, region: str, target: str, amount: int) -> dict:
     st = db.settings()
     if not st["api_enabled"]:
-        raise LikeError(st["maintenance_msg"] or "Like API abhi OFF hai.")
+        raise LikeError(st["maintenance_msg"] or "The like API is currently OFF.")
 
     target = clean_uid(target)
     if not target:
-        raise LikeError("Valid UID de (5-12 digits).")
+        raise LikeError("Enter a valid UID (5-12 digits).")
 
-    region = ffapi_norm(region)
+    region = ffapi.norm_region(region or config.DEFAULT_REGION)
     day = today_str()
 
     async with _lock_for(user_id):
         user = db.ensure_user(user_id)
         if user["banned"]:
-            raise LikeError("Tum ban ho.")
+            raise LikeError("You are banned.")
 
         amount = max(1, min(int(amount or 1), st["max_amount"]))
         used = db.daily_used(user_id, day)
         remaining = st["daily_limit"] - used
         if remaining <= 0:
-            raise LikeError(f"Aaj ka daily limit khatam. Reset in {until_reset()}.")
+            raise LikeError(f"Daily limit reached. Resets in {until_reset()}.")
         amount = min(amount, remaining)
 
         cost = st["cost_per_cmd"] + st["cost_per_like"] * (amount - 1)
         if user["credits"] < cost:
-            raise LikeError(f"Credits kam hain. Chahiye {cost}, hai {user['credits']}.")
+            raise LikeError(f"Not enough credits. Need {cost}, you have {user['credits']}.")
         if not db.try_charge(user_id, cost):
-            raise LikeError("Credits kam hain.")
+            raise LikeError("Not enough credits.")
 
         try:
             res = await pool.like_many(target, amount, region)
@@ -64,7 +65,7 @@ async def process_like(user_id: int, region: str, target: str, amount: int) -> d
         if res["ok"] == 0:
             db.refund(user_id, cost)
             db.log_like(user_id, target, 0, 0, res["guest"], "0 likes")
-            raise LikeError("Server ne saare likes reject kar diye. Credits refund.")
+            raise LikeError("The server rejected every like. Credits refunded.")
 
         db.add_daily(user_id, res["ok"], day)
         db.bump_total(user_id, res["ok"])
@@ -76,8 +77,3 @@ async def process_like(user_id: int, region: str, target: str, amount: int) -> d
             "credits": db.get_user(user_id)["credits"],
             "remaining": max(0, st["daily_limit"] - used - res["ok"]),
         }
-
-
-def ffapi_norm(region: str) -> str:
-    import ffapi
-    return ffapi.norm_region(region or config.DEFAULT_REGION)
