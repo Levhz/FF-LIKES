@@ -61,8 +61,19 @@ MAX_NAME       = 12
 TARGET_REGION  = "IND"
 PASSWORD_LEN   = 64
 
+# --- rate limiting / pacing -----------------------------------------------
+MIN_GAP      = float(os.getenv("GUEST_MIN_GAP_MS", "9000")) / 1000
+MAX_GAP      = float(os.getenv("GUEST_MAX_GAP_MS", "18000")) / 1000
+MAX_RL_TRIES = int(os.getenv("GUEST_MAX_RETRIES", "6"))
+RL_BASE      = float(os.getenv("GUEST_BACKOFF_MS", "20000")) / 1000
+RL_MAX       = float(os.getenv("GUEST_MAX_BACKOFF_MS", "240000")) / 1000
+STORM_HITS   = int(os.getenv("GUEST_STORM_THRESHOLD", "3"))
+STORM_COOL   = float(os.getenv("GUEST_STORM_COOLDOWN_MS", "300000")) / 1000
+ROUTE_DELAY  = float(os.getenv("ROUTE_RETRY_DELAY_MS", "15000")) / 1000
+PROXY_FILE   = os.getenv("GUEST_PROXY_FILE", "proxies.txt")
+
 SUP_MAP = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-RETRYABLE = {408, 429, 500, 502, 503, 504}
+RETRYABLE = {408, 500, 502, 503, 504}
 
 LOGIN_HOSTS = ("loginbp.ppmainecoonghj.com", "loginbp.ggblueshark.com")
 
@@ -176,6 +187,119 @@ _dead = set()
 _route_cache = {}
 _used_names = set()
 _save_lock = threading.Lock()
+
+# ------------------------------------------------------------------ rate limit
+class RateLimited(RuntimeError):
+    pass
+
+_GEN_LOCK = threading.RLock()
+_RL_LOCK = threading.Lock()
+_RL = {"last": 0.0, "strikes": 0, "until": 0.0}
+
+
+def is_rate(r):
+    if not isinstance(r, requests.Response):
+        return False
+    if r.status_code == 429:
+        return True
+    if r.status_code == 400 and b"1006" in (r.content or b""):
+        return True
+    return False
+
+
+def _rl_cool():
+    with _RL_LOCK:
+        wait = _RL["until"] - time.time()
+    if wait > 0:
+        say(f"      cooling down {wait:.0f}s")
+        time.sleep(wait)
+
+
+def _rl_pace():
+    with _RL_LOCK:
+        wait = _RL["last"] + random.uniform(MIN_GAP, MAX_GAP) - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    with _RL_LOCK:
+        _RL["last"] = time.time()
+
+
+def _rl_ok():
+    with _RL_LOCK:
+        _RL["strikes"] = 0
+
+
+def _rl_hit():
+    """Register a rate-limit hit. Returns seconds slept if a storm cooldown fired."""
+    with _RL_LOCK:
+        _RL["strikes"] += 1
+        storm = _RL["strikes"] >= STORM_HITS
+        if storm:
+            _RL["strikes"] = 0
+            _RL["until"] = time.time() + STORM_COOL
+    if storm:
+        say(f"\n      rate-limit storm -> pause {STORM_COOL:.0f}s")
+        time.sleep(STORM_COOL)
+        return STORM_COOL
+    return 0.0
+
+
+def _rl_wait(attempt, retry_after=None):
+    if retry_after and str(retry_after).strip().isdigit():
+        time.sleep(min(float(retry_after), 120.0))
+        return
+    delay = min(RL_BASE * 2 ** (attempt - 1), RL_MAX) * random.uniform(0.7, 1.3)
+    time.sleep(delay)
+
+
+def rate_guard(fn, tries=None):
+    """Run fn() with pacing + backoff until it stops returning a 429."""
+    tries = tries or MAX_RL_TRIES
+    r = None
+    for attempt in range(1, tries + 1):
+        _rl_cool()
+        _rl_pace()
+        r = fn()
+        if not is_rate(r):
+            _rl_ok()
+            return r
+        cooled = _rl_hit()
+        if attempt < tries and not cooled:
+            _rl_wait(attempt, getattr(r, "headers", {}).get("Retry-After"))
+    return r
+
+
+# ------------------------------------------------------------------ proxies
+def _load_proxies():
+    raw = os.getenv("GUEST_PROXIES", "").replace("\n", ",")
+    lines = [p for p in raw.split(",") if p.strip()]
+    try:
+        with open(PROXY_FILE, encoding="utf-8") as f:
+            lines += f.read().splitlines()
+    except Exception:
+        pass
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "://" not in line:
+            parts = line.split(":")
+            line = (f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                    if len(parts) == 4 else f"http://{line}")
+        out.append(line)
+    return out
+
+
+_PROXIES = _load_proxies()
+
+
+def pick_proxy():
+    if not _PROXIES:
+        return None
+    url = _PROXIES[random.randrange(len(_PROXIES))]
+    return {"http": url, "https": url}
+
 
 # ------------------------------------------------------------------ helpers
 def say(*a, **kw):
@@ -354,7 +478,8 @@ def resolve(host, refresh=False):
 def _attempt(method, url, headers, data):
     try:
         return SESSION.request(method, url, headers=headers, data=data,
-                               timeout=TIMEOUT, verify=False, allow_redirects=False)
+                               timeout=TIMEOUT, verify=False, allow_redirects=False,
+                               proxies=pick_proxy())
     except requests.RequestException as e:
         return e
 
@@ -390,6 +515,8 @@ def fetch_base(base, path, headers, data=None, method="POST"):
                 r._ff_ip = f"https://{ip}"
                 return r
             best = r
+            if is_rate(r):
+                return r
             if _is_retryable(r) and attempt < RETRIES:
                 _backoff(attempt)
                 continue
@@ -404,7 +531,8 @@ def fetch(host, path, headers, data=None, method="POST", schemes=("https",)):
         for ip in resolve(host)[:4]:
             try:
                 rr = SESSION.request(method, f"http://{ip}{path}", headers=host_h,
-                                     data=data, timeout=TIMEOUT, verify=False)
+                                     data=data, timeout=TIMEOUT, verify=False,
+                                     proxies=pick_proxy())
             except requests.RequestException:
                 continue
             if rr.status_code in (200, 201):
@@ -500,17 +628,20 @@ def step_register(dev, region, ipc):
                     "Authorization": f"Signature {sig}",
                     "Content-Type": "application/json; charset=utf-8"})
     last = "register failed"
-    for attempt in range(5):
+    for attempt in range(1, MAX_RL_TRIES + 1):
+        _rl_cool()
+        _rl_pace()
         r = fetch(AUTH_HOST, "/api/v2/oauth/guest:register", headers, data=body)
         dbg("guest:register", r)
         if not isinstance(r, requests.Response):
             last = f"no response ({r})"
             time.sleep(1.5 + attempt)
             continue
-        if r.status_code == 429:
-            ra = r.headers.get("Retry-After")
-            time.sleep(int(ra) if ra and ra.isdigit() else 4 + attempt * 4)
+        if is_rate(r):
             last = "HTTP 429 rate limited"
+            cooled = _rl_hit()
+            if attempt < MAX_RL_TRIES and not cooled:
+                _rl_wait(attempt, r.headers.get("Retry-After"))
             continue
         try:
             data = r.json().get("data") or {}
@@ -525,6 +656,7 @@ def step_register(dev, region, ipc):
                 time.sleep(2 + attempt)
                 continue
             break
+        _rl_ok()
         return str(uid), password
     raise RuntimeError(last)
 
@@ -535,10 +667,12 @@ def step_token(uid, password, dev, region, ipc):
     body = {"uid": uid, "password": password, "response_type": "token",
             "client_type": CLIENT_TYPE, "client_secret": HEX_KEY.decode(),
             "client_id": APP_ID}
-    r = fetch(AUTH_HOST, "/oauth/guest/token/grant", headers, data=body)
+    r = rate_guard(lambda: fetch(AUTH_HOST, "/oauth/guest/token/grant", headers, data=body))
     dbg("token/grant", r)
     if not isinstance(r, requests.Response):
         raise RuntimeError(f"no response ({r})")
+    if is_rate(r):
+        raise RateLimited("token grant HTTP 429")
     try:
         j = r.json()
     except ValueError:
@@ -564,11 +698,14 @@ def step_register_ingame(access_token, open_id, region, name, dev, host, ipc):
                13: 1, 14: encode_f14(open_id), 15: lang, 16: 2,
                20: CLIENT_VER, 21: 1, 22: FIELD_22}
     ip = spoof_ip(ipc)
-    r = fetch(host, "/MajorRegister", _game_headers(dev, region, ip),
-              data=aes_encrypt(build_proto(payload)))
+    data = aes_encrypt(build_proto(payload))
+    h = _game_headers(dev, region, ip)
+    r = rate_guard(lambda: fetch(host, "/MajorRegister", h, data=data))
     dbg("MajorRegister", r)
     if not isinstance(r, requests.Response):
         raise RuntimeError("MajorRegister: no response")
+    if is_rate(r):
+        raise RateLimited("MajorRegister HTTP 429")
     if r.status_code not in (200, 201):
         raise RuntimeError(f"MajorRegister HTTP {r.status_code}: {r.text[:160]}")
     return r
@@ -604,11 +741,14 @@ def step_login(access_token, open_id, region, dev, host, ipc):
     ip = spoof_ip(ipc)
     body = aes_encrypt(build_proto(
         _login_payload(dev, access_token, open_id, region, ip, lang)))
-    r = fetch(host, "/MajorLogin", _game_headers(dev, region, ip, with_sv=True), data=body)
+    h = _game_headers(dev, region, ip, with_sv=True)
+    r = rate_guard(lambda: fetch(host, "/MajorLogin", h, data=body))
     dbg("MajorLogin", r)
     if isinstance(r, requests.Response) and "eyJ" in r.text:
         return _parse_jwt(r)
     if isinstance(r, requests.Response):
+        if is_rate(r):
+            raise RateLimited("MajorLogin HTTP 429")
         say(f"\n      login HTTP {r.status_code} via {getattr(r,'_ff_ip','?')}: "
             f"{r.text[:120]!r}", end="")
     return None, None
@@ -634,7 +774,8 @@ def step_choose_region(region, jwt, dev, host, ipc):
     headers = _game_headers(dev, region, spoof_ip(ipc),
                             bearer=f"Bearer {jwt}", with_sv=True)
     headers["Releaseversion"] = RELEASE
-    r = fetch(host, "/ChooseRegion", headers, data=aes_encrypt(build_proto({1: code})))
+    data = aes_encrypt(build_proto({1: code}))
+    r = rate_guard(lambda: fetch(host, "/ChooseRegion", headers, data=data))
     dbg("ChooseRegion", r)
     return r
 
@@ -706,86 +847,93 @@ def like_report(jwt, target, region=TARGET_REGION):
 
 # ------------------------------------------------------------------ library entry
 def guest_register(region):
-    dev = new_device()
-    host, ipc = route_chain(region)[0]
-    uid, pw = step_register(dev, region, ipc)
-    return uid, pw, dev
+    with _GEN_LOCK:
+        dev = new_device()
+        host, ipc = route_chain(region)[0]
+        uid, pw = step_register(dev, region, ipc)
+        return uid, pw, dev
 
 def activate(acc):
-    region = acc.get("region") or TARGET_REGION
-    dev = json.loads(acc["device"]) if isinstance(acc.get("device"), str) else acc.get("device")
-    if not dev:
-        dev = new_device()
-    last = None
-    for host, ipc in route_chain(region)[:ROUTE_TRIES]:
-        try:
-            access, open_id, srv = step_token(acc["uid"], acc["password"], dev, region, ipc)
-            step_register_ingame(access, open_id, region, acc.get("name") or "Guest",
-                                 dev, host, ipc)
-            aid, jwt = step_login(access, open_id, region, dev, host, ipc)
-            if not jwt:
-                continue
-            aid, jwt = bind_region(region, access, open_id, aid, jwt, dev, host, ipc)
-            p = profile(jwt, region, aid or acc.get("account_id") or 0,
-                        srv or client_base(region)) or {}
-            return {"jwt": jwt, "account_id": aid, "level": p.get("level") or 0,
-                    "nickname": p.get("nickname"),
-                    "server_url": srv or client_base(region), "device": dev}
-        except Exception as e:
-            last = e
-    raise RuntimeError(f"activation failed: {last}")
+    with _GEN_LOCK:
+        region = acc.get("region") or TARGET_REGION
+        dev = json.loads(acc["device"]) if isinstance(acc.get("device"), str) else acc.get("device")
+        if not dev:
+            dev = new_device()
+        last = None
+        for attempt, (host, ipc) in enumerate(route_chain(region)[:ROUTE_TRIES], 1):
+            try:
+                access, open_id, srv = step_token(acc["uid"], acc["password"], dev, region, ipc)
+                step_register_ingame(access, open_id, region, acc.get("name") or "Guest",
+                                     dev, host, ipc)
+                aid, jwt = step_login(access, open_id, region, dev, host, ipc)
+                if not jwt:
+                    continue
+                aid, jwt = bind_region(region, access, open_id, aid, jwt, dev, host, ipc)
+                p = profile(jwt, region, aid or acc.get("account_id") or 0,
+                            srv or client_base(region)) or {}
+                return {"jwt": jwt, "account_id": aid, "level": p.get("level") or 0,
+                        "nickname": p.get("nickname"),
+                        "server_url": srv or client_base(region), "device": dev}
+            except Exception as e:
+                last = e
+                if attempt < ROUTE_TRIES:
+                    time.sleep(ROUTE_DELAY * random.uniform(0.8, 1.2))
+        raise RuntimeError(f"activation failed: {last}")
 
 def create_account(region=TARGET_REGION, name_prefix=DEFAULT_NAME,
                    digits=DEFAULT_DIGITS, plain=False, out_dir=None):
-    for attempt, (host, ipc) in enumerate(route_chain(region)[:ROUTE_TRIES], 1):
-        dev = new_device()
-        name = build_name(name_prefix, digits, plain)
-        uid = password = account_id = jwt = None
-        try:
-            say(f"\n    route {attempt}/{ROUTE_TRIES} {ipc}/{host.split('.')[1]}")
-            say("      [1/4] register ....... ", end="")
-            uid, password = step_register(dev, region, ipc)
-            say(f"uid={uid}")
+    with _GEN_LOCK:
+        for attempt, (host, ipc) in enumerate(route_chain(region)[:ROUTE_TRIES], 1):
+            dev = new_device()
+            name = build_name(name_prefix, digits, plain)
+            uid = password = account_id = jwt = None
+            try:
+                _rl_cool()
+                say(f"\n    route {attempt}/{ROUTE_TRIES} {ipc}/{host.split('.')[1]}")
+                say("      [1/4] register ....... ", end="")
+                uid, password = step_register(dev, region, ipc)
+                say(f"uid={uid}")
 
-            say("      [2/4] token grant .... ", end="")
-            access_token, open_id, srv = step_token(uid, password, dev, region, ipc)
-            say("ok")
+                say("      [2/4] token grant .... ", end="")
+                access_token, open_id, srv = step_token(uid, password, dev, region, ipc)
+                say("ok")
 
-            say("      [3/4] major register . ", end="")
-            step_register_ingame(access_token, open_id, region, name, dev, host, ipc)
-            say("ok")
+                say("      [3/4] major register . ", end="")
+                step_register_ingame(access_token, open_id, region, name, dev, host, ipc)
+                say("ok")
 
-            say("      [4/4] major login .... ", end="")
-            account_id, jwt = step_login(access_token, open_id, region, dev, host, ipc)
-            say(f"id={account_id}")
+                say("      [4/4] major login .... ", end="")
+                account_id, jwt = step_login(access_token, open_id, region, dev, host, ipc)
+                say(f"id={account_id}")
 
-            account_id, jwt = bind_region(region, access_token, open_id,
-                                          account_id, jwt, dev, host, ipc)
-        except Exception as e:
-            say(f"\n      route failed: {e}")
-            if uid and not account_id:
-                say(f"      orphan uid={uid} (registered, never entered game)")
-            time.sleep(1.0 * random.uniform(0.8, 1.3))
-            continue
+                account_id, jwt = bind_region(region, access_token, open_id,
+                                              account_id, jwt, dev, host, ipc)
+            except Exception as e:
+                say(f"\n      route failed: {e}")
+                if uid and not account_id:
+                    say(f"      orphan uid={uid} (registered, never entered game)")
+                if attempt < ROUTE_TRIES:
+                    time.sleep(ROUTE_DELAY * random.uniform(0.8, 1.2))
+                continue
 
-        if not account_id or not jwt:
-            continue
+            if not account_id or not jwt:
+                continue
 
-        _route_cache[region] = (host, ipc)
-        server_url = srv or client_base(region)
-        p = profile(jwt, region, account_id, server_url) or {}
+            _route_cache[region] = (host, ipc)
+            server_url = srv or client_base(region)
+            p = profile(jwt, region, account_id, server_url) or {}
 
-        acc = {"uid": uid, "password": password, "account_id": account_id,
-               "name": name, "region": region, "jwt": jwt,
-               "server_url": server_url, "level": p.get("level") or 0,
-               "nickname": p.get("nickname"),
-               "status": "ok", "route": f"{ipc}/{host}",
-               "device": dev, "device_model": dev["model"],
-               "created": datetime.now().isoformat(timespec="seconds")}
-        if out_dir:
-            save(acc, out_dir)
-        return acc
-    return None
+            acc = {"uid": uid, "password": password, "account_id": account_id,
+                   "name": name, "region": region, "jwt": jwt,
+                   "server_url": server_url, "level": p.get("level") or 0,
+                   "nickname": p.get("nickname"),
+                   "status": "ok", "route": f"{ipc}/{host}",
+                   "device": dev, "device_model": dev["model"],
+                   "created": datetime.now().isoformat(timespec="seconds")}
+            if out_dir:
+                save(acc, out_dir)
+            return acc
+        return None
 
 # ------------------------------------------------------------------ persistence
 def save(acc, out_dir):
@@ -822,6 +970,8 @@ def diag():
     print("\n=== resolution ===")
     for host in (AUTH_HOST, *LOGIN_HOSTS):
         print(f"{host:34} {len(resolve(host, True))} ips")
+
+    print(f"\n=== proxies: {len(_PROXIES)} loaded ===")
 
     print("\n=== auth POST probe ===")
     body = json.dumps({"app_id": 100067, "client_type": 2,
@@ -907,6 +1057,7 @@ def main():
     print("\n=== Free Fire guest generator ===")
     print(f"\n  region: {region}   spoof: {SPOOF_OVERRIDE or '(auto)'}   "
           f"count: {count}   out: ./{out_dir}/")
+    print(f"  pace: {MIN_GAP:.0f}-{MAX_GAP:.0f}s   proxies: {len(_PROXIES)}")
 
     ok = 0
     for i in range(1, count + 1):
